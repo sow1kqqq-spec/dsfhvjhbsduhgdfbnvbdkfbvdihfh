@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# -*- coding: utf-8 -*-
 
 import os
 import sys
@@ -17,13 +18,14 @@ from flask import Flask, request, jsonify
 # Flask приложение
 app = Flask(__name__)
 
-# Автоустановка зависимостей (для локального запуска)
+# Автоустановка зависимостей
 def auto_install():
     packages = ['telethon', 'apscheduler', 'loguru', 'pillow', 'aiogram']
     for package in packages:
         try:
             __import__(package)
         except ImportError:
+            print(f"📦 Устанавливаем {package}...")
             os.system(f"{sys.executable} -m pip install {package} --quiet")
 
 auto_install()
@@ -57,7 +59,7 @@ from aiogram.types import InlineKeyboardButton
 # ============ КОНФИГУРАЦИЯ ============
 API_ID = int(os.environ.get('API_ID', 28121815))
 API_HASH = os.environ.get('API_HASH', "05ad718bad150a8e636724e9fed59503")
-BOT_TOKEN = os.environ.get('BOT_TOKEN', "8901136470:AAHjRcYCMrK3WUJ75pI-0y1YtbLk1qeAZEs")
+BOT_TOKEN = os.environ.get('BOT_TOKEN', "8623020714:AAEMrAXut5206u-Tm2hARvT2bgY15nU4Jxc")
 ADMIN_IDS = [8365786708, 6668784806]
 CARD_NUMBER = "2202 2081 8598 3716"
 FREE_TRIAL_DAYS = 3
