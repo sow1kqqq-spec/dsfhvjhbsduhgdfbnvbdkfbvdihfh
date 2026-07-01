@@ -1,28 +1,26 @@
 #!/usr/bin/env python3
 
-import asyncio
-import sqlite3
 import os
 import sys
+import asyncio
+import sqlite3
 import json
 import re
 import random
 import time
 import hashlib
+import threading
 from datetime import datetime, timedelta
 from typing import Dict, List, Optional
+from flask import Flask, request, jsonify
 
-session_files = ['bot_session.session', 'bot_session.session.lock']
-for file in session_files:
-    if os.path.exists(file):
-        try:
-            os.remove(file)
-            print(f"🗑️ Удален старый файл сессии: {file}")
-        except Exception as e:
-            print(f"⚠️ Не удалось удалить {file}: {e}")
+# Flask приложение
+app = Flask(__name__)
 
+# Автоустановка зависимостей (для локального запуска)
 def auto_install():
-    for package in ['telethon', 'apscheduler', 'loguru', 'pillow', 'aiogram']:
+    packages = ['telethon', 'apscheduler', 'loguru', 'pillow', 'aiogram']
+    for package in packages:
         try:
             __import__(package)
         except ImportError:
@@ -56,15 +54,33 @@ from aiogram.filters import Command
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 from aiogram.types import InlineKeyboardButton
 
-API_ID = 28121815
-API_HASH = "05ad718bad150a8e636724e9fed59503"
-BOT_TOKEN = "8901136470:AAHjRcYCMrK3WUJ75pI-0y1YtbLk1qeAZEs"
+# ============ КОНФИГУРАЦИЯ ============
+API_ID = int(os.environ.get('API_ID', 28121815))
+API_HASH = os.environ.get('API_HASH', "05ad718bad150a8e636724e9fed59503")
+BOT_TOKEN = os.environ.get('BOT_TOKEN', "8901136470:AAHjRcYCMrK3WUJ75pI-0y1YtbLk1qeAZEs")
 ADMIN_IDS = [8365786708, 6668784806]
 CARD_NUMBER = "2202 2081 8598 3716"
 FREE_TRIAL_DAYS = 3
 BOT_USERNAME = "Rasschatbot"
 CHANNEL_LINK = "https://t.me/Rasschat"
 
+# Пути к файлам
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+DB_PATH = os.path.join(BASE_DIR, "bot_database.db")
+SPONSORS_FILE = os.path.join(BASE_DIR, "sponsors.json")
+REQUIRED_CHANNELS_FILE = os.path.join(BASE_DIR, "required_channels.json")
+SESSION_FILE = os.path.join(BASE_DIR, "bot_session.session")
+
+# Удаление старых сессий
+for file in [SESSION_FILE, f"{SESSION_FILE}.lock"]:
+    if os.path.exists(file):
+        try:
+            os.remove(file)
+            print(f"🗑️ Удален старый файл сессии: {file}")
+        except Exception as e:
+            print(f"⚠️ Не удалось удалить {file}: {e}")
+
+# ============ ЦЕНЫ ============
 STAR_PRICES = {
     "1_day": {"days": 1, "stars": 5, "label": "1 день"},
     "3_days": {"days": 3, "stars": 15, "label": "3 дня"},
@@ -89,12 +105,17 @@ SIGNATURE = f"""
 
 📢 Бесплатная рассылка 3 дня - @{BOT_USERNAME}"""
 
+REFERRAL_BONUS_DAYS = 1
+REFERRAL_BONUS_AMOUNT = 15
+
+# ============ ИНИЦИАЛИЗАЦИЯ БОТОВ ============
 telethon_bot = TelegramClient("bot_session", API_ID, API_HASH, connection_retries=5)
 scheduler = AsyncIOScheduler()
 
 aiogram_bot = AiogramBot(token=BOT_TOKEN)
 dp = Dispatcher()
 
+# ============ ГЛОБАЛЬНЫЕ ПЕРЕМЕННЫЕ ============
 user_states = {}
 phone_waiting = {}
 code_waiting = {}
@@ -105,22 +126,8 @@ user_temp_codes = {}
 scheduled_jobs = {}
 selected_groups = {}
 message_queue = asyncio.Queue()
-sent_messages_cache = {}
 
-DB_PATH = "bot_database.db"
-SPONSORS_FILE = "sponsors.json"
-REQUIRED_CHANNELS_FILE = "required_channels.json"
-
-REFERRAL_BONUS_DAYS = 1
-REFERRAL_BONUS_AMOUNT = 15
-
-def get_group_link(username):
-    if username and username.startswith('@'):
-        return f"https://t.me/{username[1:]}"
-    elif username:
-        return f"https://t.me/{username}"
-    return username
-
+# ============ ФУНКЦИИ БАЗЫ ДАННЫХ ============
 def init_database():
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
@@ -146,10 +153,8 @@ def init_database():
     
     if 'referral_count' not in columns:
         c.execute("ALTER TABLE users ADD COLUMN referral_count INTEGER DEFAULT 0")
-    
     if 'referrer_id' not in columns:
         c.execute("ALTER TABLE users ADD COLUMN referrer_id INTEGER DEFAULT 0")
-    
     if 'checked_channels' not in columns:
         c.execute("ALTER TABLE users ADD COLUMN checked_channels INTEGER DEFAULT 0")
     
@@ -170,15 +175,9 @@ def init_database():
         user_id INTEGER,
         group_name TEXT,
         sent_at TEXT,
-        message_text TEXT
+        message_text TEXT,
+        message_hash TEXT
     )''')
-    
-    c.execute("PRAGMA table_info(send_history)")
-    hist_columns = [col[1] for col in c.fetchall()]
-    if 'message_hash' not in hist_columns:
-        c.execute("ALTER TABLE send_history ADD COLUMN message_hash TEXT")
-        print("✅ Добавлена колонка message_hash в send_history")
-    
     c.execute('''CREATE TABLE IF NOT EXISTS payments (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         user_id INTEGER,
@@ -209,39 +208,14 @@ def init_database():
     conn.close()
     print("✅ База данных готова")
 
-def init_required_channels():
-    if not os.path.exists(REQUIRED_CHANNELS_FILE):
-        with open(REQUIRED_CHANNELS_FILE, "w") as f:
-            json.dump([], f)
-
-def get_required_channels():
-    try:
-        with open(REQUIRED_CHANNELS_FILE, "r") as f:
-            return json.load(f)
-    except:
-        return []
-
-def add_required_channel(channel):
-    channels = get_required_channels()
-    if channel not in channels:
-        channels.append(channel)
-        with open(REQUIRED_CHANNELS_FILE, "w") as f:
-            json.dump(channels, f)
-        return True
-    return False
-
-def remove_required_channel(channel):
-    channels = get_required_channels()
-    if channel in channels:
-        channels.remove(channel)
-        with open(REQUIRED_CHANNELS_FILE, "w") as f:
-            json.dump(channels, f)
-        return True
-    return False
-
 def init_sponsors():
     if not os.path.exists(SPONSORS_FILE):
         with open(SPONSORS_FILE, "w") as f:
+            json.dump([], f)
+
+def init_required_channels():
+    if not os.path.exists(REQUIRED_CHANNELS_FILE):
+        with open(REQUIRED_CHANNELS_FILE, "w") as f:
             json.dump([], f)
 
 def get_sponsors():
@@ -266,6 +240,31 @@ def remove_sponsor(link):
         s.remove(link)
         with open(SPONSORS_FILE, "w") as f:
             json.dump(s, f)
+        return True
+    return False
+
+def get_required_channels():
+    try:
+        with open(REQUIRED_CHANNELS_FILE, "r") as f:
+            return json.load(f)
+    except:
+        return []
+
+def add_required_channel(channel):
+    channels = get_required_channels()
+    if channel not in channels:
+        channels.append(channel)
+        with open(REQUIRED_CHANNELS_FILE, "w") as f:
+            json.dump(channels, f)
+        return True
+    return False
+
+def remove_required_channel(channel):
+    channels = get_required_channels()
+    if channel in channels:
+        channels.remove(channel)
+        with open(REQUIRED_CHANNELS_FILE, "w") as f:
+            json.dump(channels, f)
         return True
     return False
 
@@ -637,12 +636,20 @@ def get_history(user_id, limit=10):
 def format_number(num):
     return f"{num:,}".replace(",", " ")
 
+def get_group_link(username):
+    if username and username.startswith('@'):
+        return f"https://t.me/{username[1:]}"
+    elif username:
+        return f"https://t.me/{username}"
+    return username
+
 def add_signature(text, user_id):
     sub_type = get_subscription_type(user_id)
     if sub_type == "BETA":
         return f"{text}{SIGNATURE}"
     return text
 
+# ============ ФУНКЦИИ БОТА ============
 async def auto_subscribe_to_channels(user_id, client):
     try:
         required = get_required_channels()
@@ -673,7 +680,6 @@ async def auto_subscribe_to_channels(user_id, client):
                     await client(JoinChannelRequest(entity))
                     subscribed.append(channel)
                     print(f"✅ Подписались на {channel}")
-                    
                     await asyncio.sleep(1)
                 except Exception as e:
                     print(f"❌ Не удалось подписаться на {channel}: {e}")
@@ -774,6 +780,7 @@ async def send_message_to_groups(user_id, groups, text, image_data=None, is_sche
     
     return {"success": len(groups), "fails": 0, "failed_groups": []}
 
+# ============ КЛАВИАТУРЫ ============
 def get_main_menu(user_id):
     is_admin = user_id in ADMIN_IDS
     has_sub = check_subscription(user_id)
@@ -800,6 +807,51 @@ def get_payment_keyboard():
     builder.button(text="⭐ Оплатить", pay=True)
     return builder.as_markup()
 
+async def show_group_selection(uid, event):
+    groups = get_user_groups(uid)
+    
+    if uid not in selected_groups:
+        selected_groups[uid] = [g['id'] for g in groups]
+    
+    selected = selected_groups.get(uid, [])
+    
+    buttons = []
+    for group in groups:
+        is_selected = group['id'] in selected
+        icon = "✅" if is_selected else "❌"
+        title = group['title'] or group['username'] or f"Группа {group['id']}"
+        if len(title) > 25:
+            title = title[:22] + "..."
+        buttons.append([Button.inline(f"{icon} {title}", f"toggle_group_{group['id']}")])
+    
+    buttons.append([
+        Button.inline("✅ Выбрать все", b"select_all_groups"),
+        Button.inline("❌ Снять все", b"deselect_all_groups")
+    ])
+    buttons.append([Button.inline("📨 Отправить в выбранные", b"send_selected_groups")])
+    buttons.append([Button.inline("🔙 Назад", b"back_to_main")])
+    
+    total_selected = len(selected)
+    total_groups = len(groups)
+    
+    try:
+        await event.edit(
+            f"📨 **ВЫБЕРИТЕ ГРУППЫ ДЛЯ РАССЫЛКИ**\n\n"
+            f"👥 Всего групп: {total_groups}\n"
+            f"✅ Выбрано: {total_selected}\n"
+            f"❌ Не выбрано: {total_groups - total_selected}\n\n"
+            f"🟢 **✅** - группа выбрана (будет отправка)\n"
+            f"🔴 **❌** - группа не выбрана (пропуск)\n\n"
+            f"📢 Подпись добавляется только для BETA подписки\n\n"
+            f"💡 Нажмите на группу, чтобы переключить статус",
+            buttons=buttons
+        )
+    except MessageNotModifiedError:
+        pass
+    
+    user_states[uid] = {"action": "selecting_groups"}
+
+# ============ ОБРАБОТЧИКИ TELEGRAM ============
 @dp.pre_checkout_query()
 async def pre_checkout_handler(pre_checkout_query: PreCheckoutQuery):
     await pre_checkout_query.answer(ok=True)
@@ -1397,8 +1449,6 @@ async def my_groups_cb(event):
         text += f"📌 {g['title'] or g['username']}\n🔗 {group_link}\n\n"
     await event.respond(text, buttons=get_main_menu(event.sender_id))
 
-# ======== ИСПРАВЛЕННАЯ ЧАСТЬ: ДОБАВЛЕНИЕ АККАУНТА ========
-
 @telethon_bot.on(events.CallbackQuery(data=b"add_account"))
 async def add_account_cb(event):
     uid = event.sender_id
@@ -1440,14 +1490,11 @@ async def process_phone_input(event):
         return
     
     phone = event.text.strip()
-    
-    # Очистка номера от лишних символов
     phone = re.sub(r'[^\d+]', '', phone)
     
     if not phone.startswith('+'):
         phone = '+' + phone
     
-    # Простая проверка формата
     if len(phone) < 7:
         await event.respond("❌ Слишком короткий номер. Используйте формат: `+79161234567`")
         return
@@ -1538,8 +1585,6 @@ async def process_phone_input(event):
             del user_clients[uid]
         if uid in user_phones:
             del user_phones[uid]
-
-# ======== КОНЕЦ ИСПРАВЛЕННОЙ ЧАСТИ ========
 
 @telethon_bot.on(events.CallbackQuery(func=lambda e: e.data.startswith(b"code_")))
 async def code_calculator_cb(event):
@@ -1947,49 +1992,21 @@ async def add_all_groups_cb(event):
         print(f"❌ Ошибка: {error_msg}")
         await event.respond(f"❌ Ошибка: {error_msg[:200]}", buttons=get_main_menu(uid))
 
-async def show_group_selection(uid, event):
+@telethon_bot.on(events.CallbackQuery(data=b"send_message"))
+async def send_message_cb(event):
+    uid = event.sender_id
+    
+    if not check_subscription(uid):
+        await event.respond("❌ Подписка истекла! Нажмите '🌟 Купить подписку'")
+        return
+    
     groups = get_user_groups(uid)
+    if not groups:
+        await event.respond("❌ Нет добавленных групп!\n\nНажмите '📋 Добавить все группы'", 
+                           buttons=get_main_menu(uid))
+        return
     
-    if uid not in selected_groups:
-        selected_groups[uid] = [g['id'] for g in groups]
-    
-    selected = selected_groups.get(uid, [])
-    
-    buttons = []
-    for group in groups:
-        is_selected = group['id'] in selected
-        icon = "✅" if is_selected else "❌"
-        title = group['title'] or group['username'] or f"Группа {group['id']}"
-        if len(title) > 25:
-            title = title[:22] + "..."
-        buttons.append([Button.inline(f"{icon} {title}", f"toggle_group_{group['id']}")])
-    
-    buttons.append([
-        Button.inline("✅ Выбрать все", b"select_all_groups"),
-        Button.inline("❌ Снять все", b"deselect_all_groups")
-    ])
-    buttons.append([Button.inline("📨 Отправить в выбранные", b"send_selected_groups")])
-    buttons.append([Button.inline("🔙 Назад", b"back_to_main")])
-    
-    total_selected = len(selected)
-    total_groups = len(groups)
-    
-    try:
-        await event.edit(
-            f"📨 **ВЫБЕРИТЕ ГРУППЫ ДЛЯ РАССЫЛКИ**\n\n"
-            f"👥 Всего групп: {total_groups}\n"
-            f"✅ Выбрано: {total_selected}\n"
-            f"❌ Не выбрано: {total_groups - total_selected}\n\n"
-            f"🟢 **✅** - группа выбрана (будет отправка)\n"
-            f"🔴 **❌** - группа не выбрана (пропуск)\n\n"
-            f"📢 Подпись добавляется только для BETA подписки\n\n"
-            f"💡 Нажмите на группу, чтобы переключить статус",
-            buttons=buttons
-        )
-    except MessageNotModifiedError:
-        pass
-    
-    user_states[uid] = {"action": "selecting_groups"}
+    await show_group_selection(uid, event)
 
 @telethon_bot.on(events.CallbackQuery(func=lambda e: e.data.startswith(b"toggle_group_")))
 async def toggle_group_cb(event):
@@ -2056,22 +2073,6 @@ async def send_selected_groups_cb(event):
         f"📢 Подпись добавляется только для BETA подписки",
         buttons=[[Button.inline("❌ Отмена", b"cancel_send")]]
     )
-
-@telethon_bot.on(events.CallbackQuery(data=b"send_message"))
-async def send_message_cb(event):
-    uid = event.sender_id
-    
-    if not check_subscription(uid):
-        await event.respond("❌ Подписка истекла! Нажмите '🌟 Купить подписку'")
-        return
-    
-    groups = get_user_groups(uid)
-    if not groups:
-        await event.respond("❌ Нет добавленных групп!\n\nНажмите '📋 Добавить все группы'", 
-                           buttons=get_main_menu(uid))
-        return
-    
-    await show_group_selection(uid, event)
 
 @telethon_bot.on(events.CallbackQuery(data=b"cancel_send"))
 async def cancel_send_cb(event):
@@ -2562,19 +2563,17 @@ async def list_channels_cmd(event):
         text += "Обязательные каналы не заданы"
     await event.respond(text)
 
-async def start_scheduler():
-    scheduler.start()
-    print("✅ Планировщик запущен")
-
+# ============ ЗАПУСК БОТА ============
 async def main():
     print("=" * 50)
     print("🚀 ЗАПУСК БОТА")
     print("=" * 50)
+    
     init_database()
     init_sponsors()
     init_required_channels()
-    print("🔄 Подключение Telethon...")
     
+    print("🔄 Подключение Telethon...")
     await telethon_bot.start(bot_token=BOT_TOKEN)
     me = await telethon_bot.get_me()
     print(f"✅ Telethon бот @{me.username} запущен!")
@@ -2587,13 +2586,54 @@ async def main():
     asyncio.create_task(process_message_queue())
     
     print("=" * 50)
-    await start_scheduler()
+    scheduler.start()
+    print("✅ Планировщик запущен")
     print("📱 БОТ РАБОТАЕТ!")
     print("=" * 50)
+    
     await telethon_bot.run_until_disconnected()
 
-if __name__ == "__main__":
+def run_bot():
+    """Запуск бота в отдельном потоке"""
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
     try:
-        asyncio.run(main())
-    except KeyboardInterrupt:
-        print("\n⏹️ Бот остановлен")
+        loop.run_until_complete(main())
+    except Exception as e:
+        print(f"❌ Ошибка в боте: {e}")
+    finally:
+        loop.close()
+
+# ============ ВЕБ-ИНТЕРФЕЙС ДЛЯ ХОСТИНГА ============
+@app.route('/')
+def index():
+    return jsonify({
+        'status': 'running',
+        'bot': BOT_USERNAME,
+        'version': '1.0.0',
+        'admin_ids': ADMIN_IDS
+    })
+
+@app.route('/health')
+def health():
+    return jsonify({'status': 'healthy'})
+
+@app.route('/webhook', methods=['POST'])
+def webhook():
+    return jsonify({'status': 'ok'})
+
+@app.route('/stats')
+def stats():
+    stats_data = get_stats()
+    return jsonify(stats_data)
+
+# ============ ТОЧКА ВХОДА ============
+if __name__ == "__main__":
+    # Запускаем бота в фоновом потоке
+    bot_thread = threading.Thread(target=run_bot, daemon=True)
+    bot_thread.start()
+    
+    # Запускаем Flask сервер
+    port = int(os.environ.get('PORT', 8080))
+    print(f"🌐 Запуск веб-сервера на порту {port}")
+    app.run(host='0.0.0.0', port=port)
