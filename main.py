@@ -955,8 +955,6 @@ def get_rarity_name_t(rarity: str, lang: str) -> str:
     if translated == key:
         return rarity.capitalize()
     return translated
-
-
 BOT_TOKEN = os.getenv("BOT_TOKEN", "8859688778:AAHMCzIGeuXN9MT9fdonHjfMedi17t4uMR4")
 CHANNEL_ID = "@gag2_sctockchannel"
 ADMIN_IDS = [6668784806, 6296203371]
